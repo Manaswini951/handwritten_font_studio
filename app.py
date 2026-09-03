@@ -236,22 +236,33 @@ def detect_and_extract_glyphs(binary_mask, min_area=MIN_COMPONENT_AREA, proximit
 
 
 # ============================================================
-# SYNTHETIC GLYPH GENERATOR (FALLBACK FOR MISSING CHARS)
+# SYNTHETIC GLYPH GENERATOR (SAFE FALLBACK FOR UNMAPPED CHARS)
 # ============================================================
 
 def generate_fallback_bitmap(character, target_h=400, target_w=300):
     img = Image.new("L", (target_w, target_h), 0)
     draw = ImageDraw.Draw(img)
 
-    try:
-        font = ImageFont.truetype("arial.ttf", int(target_h * 0.7))
-    except IOError:
+    font = None
+    # Try common cross-platform font paths safely
+    font_paths = ["arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+    for path in font_paths:
+        try:
+            font = ImageFont.truetype(path, int(target_h * 0.7))
+            break
+        except Exception:
+            continue
+
+    if font is None:
         font = ImageFont.load_default()
 
-    bbox = draw.textbbox((0, 0), character, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    x = (target_w - tw) // 2
-    y = (target_h - th) // 2 - bbox[1]
+    try:
+        bbox = draw.textbbox((0, 0), character, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x = (target_w - tw) // 2
+        y = (target_h - th) // 2 - bbox[1]
+    except Exception:
+        x, y = target_w // 4, target_h // 4
 
     draw.text((x, y), character, fill=255, font=font)
 
@@ -429,7 +440,7 @@ def compile_50_variant_ttf(mapped_components, font_name="MyHandwriting50Var"):
     notdef_pen.closePath()
     glyph_objects[".notdef"] = notdef_pen.glyph()
 
-    # SPACE GLYPH (Explicitly defined empty pen outline)
+    # SPACE GLYPH (Explicitly registered blank glyph object)
     space_pen = TTGlyphPen(None)
     glyph_objects["space"] = space_pen.glyph()
 
@@ -440,7 +451,7 @@ def compile_50_variant_ttf(mapped_components, font_name="MyHandwriting50Var"):
         if character and len(character) == 1 and character in CHARACTER_SET:
             character_map[character] = comp["crop_mask"]
 
-    # Fallback Generation for missing letters/numbers
+    # Generate Fallback Bitmaps for missing/unmapped characters
     for char in CHARACTER_SET:
         if char not in character_map:
             character_map[char] = generate_fallback_bitmap(char)
@@ -478,6 +489,7 @@ def compile_50_variant_ttf(mapped_components, font_name="MyHandwriting50Var"):
             pua_codepoint = get_pua_codepoint(character, variation_idx)
             cmap[pua_codepoint] = variant_gname
 
+    # Fixed FontBuilder parameter: unitsPerEm (camelCase)
     fb = FontBuilder(unitsPerEm=UNITS_PER_EM, isTTF=True)
     fb.setupGlyphOrder(glyph_order)
     fb.setupCharacterMap(cmap)
