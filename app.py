@@ -129,10 +129,6 @@ def preprocess_reference_image(pil_image, contrast=1.1, denoise_strength=5):
 
 
 def merge_nearby_stroke_boxes(boxes, max_distance=12):
-    """
-    Merges disconnected strokes belonging to the same handwritten character
-    (e.g., accents, dots, crossbars) while preventing horizontal chaining across distinct letters.
-    """
     if not boxes:
         return []
 
@@ -156,18 +152,15 @@ def merge_nearby_stroke_boxes(boxes, max_distance=12):
                     continue
                 xj, yj, wj, hj, maskj = boxes[j]
 
-                # Calculate gaps
                 gap_x = max(0, max(curr_x1 - (xj + wj), xj - curr_x2))
                 gap_y = max(0, max(curr_y1 - (yj + hj), yj - curr_y2))
 
                 overlap_x = max(0, min(curr_x2, xj + wj) - max(curr_x1, xj))
                 overlap_y = max(0, min(curr_y2, yj + hj) - max(curr_y1, yj))
 
-                # Allow merge if strokes overlap vertically OR are vertically stacked (e.g. dots/accents)
                 is_vertically_aligned = (gap_y <= max_distance * 1.5 and overlap_x > 0)
                 is_horizontally_tight = (gap_x <= max_distance and overlap_y > 0.15 * min(curr_y2 - curr_y1, hj))
 
-                # Safeguard against chaining distant letters together horizontally
                 new_w = max(curr_x2, xj + wj) - min(curr_x1, xj)
                 max_glyph_width = max(w1, wj) * 2.5 + 40
 
@@ -197,19 +190,14 @@ def merge_nearby_stroke_boxes(boxes, max_distance=12):
 
 def detect_and_extract_glyphs(binary_mask, min_area=MIN_COMPONENT_AREA, proximity_threshold=DEFAULT_PROXIMITY):
     h_img, w_img = binary_mask.shape
-
-    # Connected components without destructive erosion pass
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
 
     raw_boxes = []
     for i in range(1, num_labels):
         x, y, w, h, area = stats[i]
 
-        # Lower minimum threshold to preserve thin calligraphic tails
         if area < min_area or w < 4 or h < 4:
             continue
-
-        # Generous dimensions so tall letters like F, H, J, S are preserved
         if w > w_img * 0.35 or h > h_img * 0.50:
             continue
 
@@ -231,7 +219,6 @@ def detect_and_extract_glyphs(binary_mask, min_area=MIN_COMPONENT_AREA, proximit
             "assigned_char": ""
         })
 
-    # Row and Column Sorting
     if extracted:
         heights = [item["bbox"][3] for item in extracted]
         avg_h = max(20, np.mean(heights))
@@ -246,6 +233,36 @@ def detect_and_extract_glyphs(binary_mask, min_area=MIN_COMPONENT_AREA, proximit
             item["id"] = i + 1
 
     return extracted
+
+
+# ============================================================
+# SYNTHETIC GLYPH GENERATOR (FALLBACK FOR MISSING CHARS)
+# ============================================================
+
+def generate_fallback_bitmap(character, target_h=400, target_w=300):
+    """
+    Renders a clean hand-drawn style bitmap mask for unmapped/missing characters.
+    """
+    img = Image.new("L", (target_w, target_h), 0)
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font = ImageFont.truetype("arial.ttf", int(target_h * 0.7))
+    except IOError:
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), character, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = (target_w - tw) // 2
+    y = (target_h - th) // 2 - bbox[1]
+
+    draw.text((x, y), character, fill=255, font=font)
+
+    arr = np.array(img, dtype=np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    arr = cv2.dilate(arr, kernel, iterations=2)
+
+    return arr
 
 
 # ============================================================
@@ -414,13 +431,23 @@ def compile_50_variant_ttf(mapped_components, font_name="MyHandwriting50Var"):
     notdef_pen.closePath()
     glyph_objects[".notdef"] = notdef_pen.glyph()
 
+    # Collect explicitly mapped characters
+    character_map = {}
     for comp in mapped_components:
         character = comp.get("assigned_char", "").strip()
-        if not character or len(character) != 1 or character not in CHARACTER_SET:
-            continue
+        if character and len(character) == 1 and character in CHARACTER_SET:
+            character_map[character] = comp["crop_mask"]
 
+    # Fallback Generation for missing letters/numbers
+    for char in CHARACTER_SET:
+        if char not in character_map:
+            # Generate fallback bitmap mask
+            character_map[char] = generate_fallback_bitmap(char)
+
+    # Compile all characters into TTF
+    for character, crop_mask in character_map.items():
         available_characters.add(character)
-        base = crop_to_content(comp["crop_mask"], padding=5)
+        base = crop_to_content(crop_mask, padding=5)
 
         for variation_idx in range(1, NUM_VARIATIONS + 1):
             variant = apply_procedural_glyph_variation(base, variation_idx=variation_idx, base_seed=ord(character))
@@ -450,10 +477,8 @@ def compile_50_variant_ttf(mapped_components, font_name="MyHandwriting50Var"):
             pua_codepoint = get_pua_codepoint(character, variation_idx)
             cmap[pua_codepoint] = variant_gname
 
-    if not available_characters:
-        raise ValueError("No mapped characters found to compile font.")
-
-    fb = FontBuilder(units_per_em=UNITS_PER_EM, isTTF=True)
+    # Fixed FontBuilder parameter: unitsPerEm (camelCase)
+    fb = FontBuilder(unitsPerEm=UNITS_PER_EM, isTTF=True)
     fb.setupGlyphOrder(glyph_order)
     fb.setupCharacterMap(cmap)
     fb.setupGlyf(glyph_objects)
@@ -648,11 +673,11 @@ if app_mode == "1. Extract & Build 50-Variant TTF":
 
         if st.button("⚙️ BUILD ONE TTF WITH 50 VARIATIONS", type="primary", use_container_width=True):
             try:
-                with st.spinner("Generating 50 variations per character and compiling TTF..."):
+                with st.spinner("Generating 50 variations per character (including fallbacks for unmapped characters) and compiling TTF..."):
                     ttf_bytes, available_characters = compile_50_variant_ttf(st.session_state.components, font_name=font_name)
                     st.session_state.generated_ttf = ttf_bytes
                     st.session_state.font_characters = available_characters
-                st.success("🎉 Single TTF file built successfully with 50 variations embedded!")
+                st.success("🎉 Single TTF file built successfully with 50 variations embedded for ALL characters!")
             except Exception as e:
                 st.error(f"Font compilation error: {e}")
 
