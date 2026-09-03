@@ -148,8 +148,18 @@ def compile_ttf_font(mapped_components, font_name="HandmadeFont", units_per_em=2
     cmap = {32: "space"}
     char_glyph_map = {}
     
+    # Auto-assign characters if user didn't enter any
+    default_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    auto_idx = 0
+
     for comp in mapped_components:
         char = comp.get("assigned_char", "").strip()
+        if not char and comp.get("classification") == "Letter":
+            if auto_idx < len(default_alphabet):
+                char = default_alphabet[auto_idx]
+                comp["assigned_char"] = char
+                auto_idx += 1
+
         if char and comp.get("classification") == "Letter":
             glyph_name = f"glyph_{ord(char)}"
             if glyph_name not in glyph_order:
@@ -158,7 +168,7 @@ def compile_ttf_font(mapped_components, font_name="HandmadeFont", units_per_em=2
                 char_glyph_map[glyph_name] = comp
                 
     if len(glyph_order) <= 2:
-        raise ValueError("Assign at least 1 character mapping before building font.")
+        raise ValueError("No glyphs detected to build font. Please upload a clear alphabet image.")
 
     glyphs = {}
     pen = TTGlyphPen(None)
@@ -465,4 +475,18 @@ else:
 
             if st.button("🚀 GENERATE 50 T-SHIRT DESIGNS", type="primary", use_container_width=True):
                 with st.spinner("Generating 50 compositions..."):
-                    st.session_state.tshirt_variations = generate
+                    st.session_state.tshirt_variations = generate_50_tshirt_variations(
+                        tshirt_phrase, st.session_state.style_profile, artwork_pil, canvas_dim, master_seed
+                    )
+                st.success("Generated 50 unique T-shirt designs!")
+
+    with tab_export:
+        if st.session_state.tshirt_variations:
+            st.image(create_preview_gallery_grid(st.session_state.tshirt_variations), use_container_width=True)
+            sel_idx = st.selectbox("Select Design:", options=list(range(len(st.session_state.tshirt_variations))), format_func=lambda i: st.session_state.tshirt_variations[i]["style_name"])
+            selected_var = st.session_state.tshirt_variations[sel_idx]
+            
+            buf = io.BytesIO()
+            selected_var["image"].save(buf, format="PNG", dpi=(300, 300))
+            st.download_button(f"📥 Download Design #{selected_var['id']:03d}", buf.getvalue(), f"tshirt_design_{selected_var['id']:03d}.png", "image/png")
+            st.download_button("📦 Download All 50 Designs (ZIP)", package_zip_export(st.session_state.tshirt_variations), "handwritten_tshirt_collection.zip", "application/zip", use_container_width=True)
