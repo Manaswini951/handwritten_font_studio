@@ -1,6 +1,5 @@
 streamlit
-Pillow
-numpy
 opencv-python-headless
+numpy
+Pillow
 fonttools
-scipy
