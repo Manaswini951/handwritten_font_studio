@@ -6,7 +6,7 @@ import zipfile
 import cv2
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 from fontTools.ttLib import TTFont
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.fontBuilder import FontBuilder
@@ -19,19 +19,18 @@ st.set_page_config(
 )
 
 # ============================================================
-# UTILITIES & ROBUST IMAGE PROCESSING
+# IMAGE PROCESSING & GLYPH EXTRACTION ENGINE
 # ============================================================
 
 def preprocess_reference_image(pil_image, contrast=1.2, brightness=0, denoise_strength=5):
     arr = np.array(pil_image.convert("RGB"))
     
-    # 1. Perspective Flattening & Shadow Removal
     if contrast != 1.0 or brightness != 0:
         arr = cv2.convertScaleAbs(arr, alpha=contrast, beta=brightness)
         
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     
-    # Estimate uneven paper background lighting
+    # Background illumination estimation & shadow removal
     bg_dilated = cv2.dilate(gray, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
     bg_smooth = cv2.medianBlur(bg_dilated, 21)
     diff = 255 - cv2.absdiff(gray, bg_smooth)
@@ -40,241 +39,167 @@ def preprocess_reference_image(pil_image, contrast=1.2, brightness=0, denoise_st
     if denoise_strength > 0:
         norm = cv2.fastNlMeansDenoising(norm, h=denoise_strength)
         
-    # Adaptive Otsu Thresholding
-    _, binary = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Adaptive thresholding
+    binary = cv2.adaptiveThreshold(
+        norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 41, 12
+    )
     
-    # Fill tiny gaps without destroying thin strokes
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
     
     preview_cleaned = cv2.cvtColor(255 - cleaned, cv2.COLOR_GRAY2RGBA)
     return cleaned, Image.fromarray(preview_cleaned)
 
-def merge_nearby_boxes(boxes, distance_threshold=25):
-    """Merges disconnected pen strokes and dots into unified letter components."""
-    if not boxes:
-        return []
-        
-    merged = []
-    used = [False] * len(boxes)
-    
-    for i in range(len(boxes)):
-        if used[i]:
-            continue
-        x1, y1, w1, h1, a1, mask1 = boxes[i]
-        curr_x2, curr_y2 = x1 + w1, y1 + h1
-        curr_x1, curr_y1 = x1, y1
-        masks_to_combine = [(x1, y1, mask1)]
-        used[i] = True
-        
-        changed = True
-        while changed:
-            changed = False
-            for j in range(len(boxes)):
-                if used[j]:
-                    continue
-                xj, yj, wj, hj, aj, maskj = boxes[j]
-                
-                # Check bounding box distance
-                if not (xj > curr_x2 + distance_threshold or 
-                        xj + wj < curr_x1 - distance_threshold or 
-                        yj > curr_y2 + distance_threshold or 
-                        yj + hj < curr_y1 - distance_threshold):
-                    
-                    curr_x1 = min(curr_x1, xj)
-                    curr_y1 = min(curr_y1, yj)
-                    curr_x2 = max(curr_x2, xj + wj)
-                    curr_y2 = max(curr_y2, yj + hj)
-                    masks_to_combine.append((xj, yj, maskj))
-                    used[j] = True
-                    changed = True
-                    
-        # Reconstruct combined mask
-        mw, mh = curr_x2 - curr_x1, curr_y2 - curr_y1
-        combined_mask = np.zeros((mh, mw), dtype=np.uint8)
-        for mx, my, mmask in masks_to_combine:
-            ox, oy = mx - curr_x1, my - curr_y1
-            combined_mask[oy:oy+mmask.shape[0], ox:ox+mmask.shape[1]] = cv2.bitwise_or(
-                combined_mask[oy:oy+mmask.shape[0], ox:ox+mmask.shape[1]], mmask
-            )
-            
-        merged.append((curr_x1, curr_y1, mw, mh, combined_mask))
-        
-    return merged
+def detect_and_extract_glyphs(binary_mask, min_area=300, dilation_size=7):
+    # Dilation to bridge separate strokes within single letters
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_size, dilation_size))
+    connected = cv2.dilate(binary_mask, kernel, iterations=1)
 
-def detect_and_extract_glyphs(binary_mask, min_area=80, max_area_pct=0.85):
-    h_img, w_img = binary_mask.shape
-    max_area = h_img * w_img * max_area_pct
-    
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        binary_mask, connectivity=8
-    )
-    
-    raw_boxes = []
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        x, y, w, h = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+    n, labels, stats, centers = cv2.connectedComponentsWithStats(connected, connectivity=8)
+    boxes = []
+
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area < min_area or w < 15 or h < 15:
+            continue
         
-        if min_area <= area <= max_area and w > 4 and h > 4:
-            crop = binary_mask[y:y+h, x:x+w]
-            raw_boxes.append((x, y, w, h, area, crop))
-            
-    # Merge disconnected pen strokes/dots
-    merged_components = merge_nearby_boxes(raw_boxes, distance_threshold=20)
-    
-    extracted_components = []
-    for idx, (x, y, w, h, crop_mask) in enumerate(merged_components):
+        # Crop mask from non-dilated binary mask
+        crop_mask = binary_mask[y:y+h, x:x+w]
+        
         rgba_crop = np.zeros((h, w, 4), dtype=np.uint8)
         rgba_crop[crop_mask > 0] = [0, 0, 0, 255]
         
-        extracted_components.append({
-            "id": idx + 1,
+        boxes.append({
+            "id": i,
             "bbox": (x, y, w, h),
-            "area": w * h,
-            "aspect_ratio": float(w) / float(h),
+            "area": area,
             "crop_mask": crop_mask,
             "preview_img": Image.fromarray(rgba_crop, "RGBA"),
-            "classification": "Letter" if (w * h > 250) else "Decoration",
             "assigned_char": ""
         })
-        
-    # Sort left-to-right, top-to-bottom
-    extracted_components.sort(key=lambda c: (c["bbox"][1] // 120, c["bbox"][0]))
-    return extracted_components
 
-def extract_style_profile(components):
-    if not components:
-        return {
-            "stroke_thickness": 0.50, "roughness": 0.30, "aspect_ratio": 0.80,
-            "height_variation": 0.20, "baseline_wobble": 0.15, "angularity": 0.40
-        }
-        
-    aspect_ratios = [c["aspect_ratio"] for c in components]
-    heights = [c["bbox"][3] for c in components]
-    
-    mean_aspect = float(np.mean(aspect_ratios)) if aspect_ratios else 0.8
-    height_std = float(np.std(heights) / (np.mean(heights) + 1e-5))
-    
-    stroke_thicknesses, roughness_scores = [], []
-    for c in components:
-        mask = c["crop_mask"]
-        dist = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
-        max_dist = np.max(dist) if np.max(dist) > 0 else 1.0
-        stroke_thicknesses.append(max_dist)
-        
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            cnt = contours[0]
-            perimeter = cv2.arcLength(cnt, True)
-            hull = cv2.convexHull(cnt)
-            hull_perimeter = cv2.arcLength(hull, True)
-            if hull_perimeter > 0:
-                roughness_scores.append(perimeter / hull_perimeter)
+    # Sort left-to-right, top-to-bottom dynamically based on row height
+    if boxes:
+        avg_h = np.mean([b["bbox"][3] for b in boxes])
+        row_height = max(50, int(avg_h * 0.75))
+        boxes.sort(key=lambda b: (b["bbox"][1] // row_height, b["bbox"][0]))
 
-    return {
-        "stroke_thickness": float(min(1.0, np.mean(stroke_thicknesses) / 15.0)),
-        "roughness": float(min(1.0, (np.mean(roughness_scores) - 1.0) if roughness_scores else 0.3)),
-        "aspect_ratio": float(np.clip(mean_aspect, 0.3, 2.0)),
-        "height_variation": float(np.clip(height_std, 0.0, 1.0)),
-        "baseline_wobble": float(np.clip(height_std * 0.8, 0.0, 1.0)),
-        "angularity": 0.35
-    }
+    return boxes
 
 # ============================================================
 # VECTORIZATION & TTF COMPILER
 # ============================================================
 
-def mask_to_font_contours(binary_crop, target_size=1000):
-    h, w = binary_crop.shape
-    if h == 0 or w == 0:
-        return []
-    padded = np.pad(binary_crop, 10, mode="constant", constant_values=0)
-    contours, hierarchy = cv2.findContours(padded, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    
+def bitmap_to_glyph(binary, target_height=700):
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     if hierarchy is None:
-        return []
+        return None
 
-    scale = float(target_size) / max(h, w)
-    vector_contours = []
-    
-    for idx, cnt in enumerate(contours):
-        pts = cnt.squeeze()
-        if pts.ndim != 2 or len(pts) < 3:
+    pen = TTGlyphPen(None)
+    height, width = binary.shape
+    scale = target_height / max(height, 1)
+
+    def convert_point(x, y):
+        return x * scale, (height - y) * scale
+
+    for i, contour in enumerate(contours):
+        is_hole = hierarchy[0][i][3] != -1
+        
+        # Simplify contour points
+        epsilon = 0.008 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        points = approx.reshape(-1, 2)
+
+        if len(points) < 3:
             continue
-        scaled_pts = []
-        for pt in pts:
-            x_val = int((pt[0] - 10) * scale)
-            y_val = int((h - (pt[1] - 10)) * scale)
-            scaled_pts.append((x_val, y_val))
-            
-        vector_contours.append({"points": scaled_pts})
-    return vector_contours
 
-def compile_ttf_font(mapped_components, font_name="HandmadeFont", units_per_em=2048):
+        converted = [convert_point(float(pt[0]), float(pt[1])) for pt in points]
+        
+        # Invert winding direction for inner holes (e.g. inside O, B, D)
+        if is_hole:
+            converted = converted[::-1]
+
+        pen.moveTo(converted[0])
+        for pt in converted[1:]:
+            pen.lineTo(pt)
+        pen.closePath()
+
+    return pen.glyph()
+
+def compile_ttf_font(mapped_components, font_name="MyHandwriting", units_per_em=1000):
     glyph_order = [".notdef", "space"]
     cmap = {32: "space"}
-    char_glyph_map = {}
-    
+    glyph_objects = {}
+
+    # Default .notdef glyph
+    notdef_pen = TTGlyphPen(None)
+    notdef_pen.moveTo((100, 0))
+    notdef_pen.lineTo((100, 700))
+    notdef_pen.lineTo((500, 700))
+    notdef_pen.lineTo((500, 0))
+    notdef_pen.closePath()
+    glyph_objects[".notdef"] = notdef_pen.glyph()
+    glyph_objects["space"] = TTGlyphPen(None).glyph()
+
+    metrics = {".notdef": (600, 0), "space": (300, 0)}
+
     default_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
     auto_idx = 0
 
     for comp in mapped_components:
         char = comp.get("assigned_char", "").strip()
-        if not char and comp.get("classification") == "Letter":
-            if auto_idx < len(default_alphabet):
-                char = default_alphabet[auto_idx]
-                comp["assigned_char"] = char
-                auto_idx += 1
+        
+        # Auto-map sequential alphabet if box left empty
+        if not char and auto_idx < len(default_alphabet):
+            char = default_alphabet[auto_idx]
+            auto_idx += 1
 
-        if char and comp.get("classification") == "Letter":
+        if char:
             glyph_name = f"glyph_{ord(char)}"
             if glyph_name not in glyph_order:
                 glyph_order.append(glyph_name)
-                cmap[ord(char)] = glyph_name
-                char_glyph_map[glyph_name] = comp
                 
+                # Trim borders and scale glyph
+                ys, xs = np.where(comp["crop_mask"] > 0)
+                if len(xs) > 0:
+                    cropped = comp["crop_mask"][ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+                    h, w = cropped.shape
+                    new_w = max(1, int(w * (700 / max(1, h))))
+                    normalized = cv2.resize(cropped, (new_w, 700), interpolation=cv2.INTER_AREA)
+                else:
+                    normalized = comp["crop_mask"]
+
+                glyph = bitmap_to_glyph(normalized)
+                if glyph is not None:
+                    glyph_objects[glyph_name] = glyph
+                    cmap[ord(char)] = glyph_name
+                    advance = int(max(350, min(1200, normalized.shape[1] * 1.15)))
+                    metrics[glyph_name] = (advance, 0)
+
     if len(glyph_order) <= 2:
-        raise ValueError("No glyphs detected to build font. Please upload a clear alphabet image.")
-
-    glyphs = {}
-    pen = TTGlyphPen(None)
-    pen.moveTo((100, 0))
-    pen.lineTo((100, 1000))
-    pen.lineTo((600, 1000))
-    pen.lineTo((600, 0))
-    pen.closePath()
-    glyphs[".notdef"] = pen.glyph()
-    glyphs["space"] = TTGlyphPen(None).glyph()
-
-    horizontal_metrics = {".notdef": (700, 100), "space": (500, 0)}
-
-    for gname, comp in char_glyph_map.items():
-        pen_g = TTGlyphPen(None)
-        vector_contours = mask_to_font_contours(comp["crop_mask"], target_size=1200)
-        for cnt in vector_contours:
-            pts = cnt["points"]
-            if len(pts) < 3:
-                continue
-            pen_g.moveTo(pts[0])
-            for pt in pts[1:]:
-                pen_g.lineTo(pt)
-            pen_g.closePath()
-        glyphs[gname] = pen_g.glyph()
-        horizontal_metrics[gname] = (1400, 100)
+        raise ValueError("No characters detected. Please upload a clear alphabet reference image.")
 
     fb = FontBuilder(units_per_em, isTTF=True)
     fb.setupGlyphOrder(glyph_order)
     fb.setupCharacterMap(cmap)
-    fb.setupGlyphs(glyphs)
-    fb.setupHorizontalMetrics({g: horizontal_metrics.get(g, (1000, 0)) for g in glyph_order})
-    fb.setupHorizontalHeader(ascent=1600, descent=-400)
-    fb.setupNameTable({"familyName": font_name, "styleName": "Regular", "uniqueFontIdentifier": f"{font_name}-1.0"})
-    fb.setupOS2(sTypoAscender=1600, sTypoDescender=-400, usWinAscent=1600, usWinDescent=400)
+    fb.setupGlyphs(glyph_objects)
+    fb.setupHorizontalMetrics(metrics)
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({
+        "familyName": font_name,
+        "styleName": "Regular",
+        "uniqueFontIdentifier": f"{font_name}-Regular",
+        "fullName": f"{font_name} Regular"
+    })
+    fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, usWinAscent=800, usWinDescent=200)
     fb.setupPost()
 
     font_stream = io.BytesIO()
     fb.save(font_stream)
     font_bytes = font_stream.getvalue()
+    
+    # Verify validity
     TTFont(io.BytesIO(font_bytes))
     return font_bytes
 
@@ -285,37 +210,10 @@ def compile_ttf_font(mapped_components, font_name="HandmadeFont", units_per_em=2
 LAYOUT_STYLES = [
     "Centered Classic", "Stacked Block", "Word Emphasis", "Mixed Letter Sizes",
     "Alternating Baseline", "Rotated Letters", "Wave Path", "Arc Layout",
-    "Circular Emblem", "Vertical Stack", "Tight Spacing", "Expanded Spacing",
-    "Huge First Letter", "Huge Last Letter", "Split Layout", "Overlapping Letters",
-    "Diagonal Tilt", "Dynamic Scatter", "Badge Composition", "Outline + Fill"
+    "Circular Emblem", "Vertical Stack", "Tight Spacing", "Expanded Spacing"
 ]
 
-def apply_procedural_style_transforms(pil_image, style_profile, seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    arr = np.array(pil_image.convert("RGBA"))
-    alpha = arr[:, :, 3]
-    if np.sum(alpha) == 0:
-        return pil_image
-
-    thick = style_profile.get("stroke_thickness", 0.5)
-    if thick > 0.6:
-        k_size = int((thick - 0.5) * 8) | 1
-        alpha = cv2.dilate(alpha, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size)), iterations=1)
-    elif thick < 0.4:
-        k_size = int((0.5 - thick) * 6) | 1
-        alpha = cv2.erode(alpha, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size)), iterations=1)
-
-    rough = style_profile.get("roughness", 0.3)
-    if rough > 0.2:
-        h, w = alpha.shape
-        noise = np.random.normal(0, rough * 12, (h, w)).astype(np.float32)
-        alpha = np.clip(cv2.GaussianBlur(alpha.astype(np.float32) + noise, (3, 3), 0), 0, 255).astype(np.uint8)
-
-    arr[:, :, 3] = alpha
-    return Image.fromarray(arr, "RGBA")
-
-def render_styled_text_layout(phrase, style_profile, canvas_size=(3000, 3000), seed=42):
+def render_styled_text_layout(phrase, canvas_size=(3000, 3000), seed=42):
     random.seed(seed)
     w_canvas, h_canvas = canvas_size
     mask = Image.new("L", (w_canvas, h_canvas), 0)
@@ -325,8 +223,6 @@ def render_styled_text_layout(phrase, style_profile, canvas_size=(3000, 3000), s
     font = ImageFont.load_default()
 
     curr_y = int(h_canvas * 0.25)
-    wobble = style_profile.get("baseline_wobble", 0.2) * 40
-
     for word in words:
         word_img = Image.new("RGBA", (w_canvas, int(base_size * 1.8)), (0, 0, 0, 0))
         wdraw = ImageDraw.Draw(word_img)
@@ -338,41 +234,30 @@ def render_styled_text_layout(phrase, style_profile, canvas_size=(3000, 3000), s
         for char in word:
             cb = font.getbbox(char)
             cw = cb[2] - cb[0]
-            cy_off = int(random.uniform(-wobble, wobble))
+            cy_off = int(random.uniform(-10, 10))
             wdraw.text((cx, 10 + cy_off), char, font=font, fill=(255, 255, 255, 255))
-            cx += cw + int(random.uniform(-5, 10))
+            cx += cw + int(random.uniform(-2, 8))
 
-        word_styled = apply_procedural_style_transforms(word_img, style_profile, seed=seed + curr_y)
-        mask.paste(word_styled.split()[3], (0, curr_y), word_styled.split()[3])
+        mask.paste(word_img.split()[3], (0, curr_y), word_img.split()[3])
         curr_y += int(base_size * 1.3)
 
     return mask
 
-def apply_artwork_clipping_mask(artwork_image, text_mask, opacity=1.0, tile=False):
+def apply_artwork_clipping_mask(artwork_image, text_mask):
     w, h = text_mask.size
-    art_rgba = artwork_image.convert("RGBA")
-    
-    if tile:
-        tw, th = art_rgba.size
-        tiled_art = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        for x in range(0, w, max(10, tw)):
-            for y in range(0, h, max(10, th)):
-                tiled_art.alpha_composite(art_rgba, (x, y))
-        art_rgba = tiled_art
-    else:
-        art_rgba = art_rgba.resize((w, h), Image.Resampling.LANCZOS)
+    art_rgba = artwork_image.convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
 
     art_arr = np.array(art_rgba, dtype=np.uint8)
     mask_arr = np.array(text_mask.convert("L"), dtype=np.uint8)
 
-    art_alpha = (art_arr[:, :, 3].astype(np.float32) / 255.0) * opacity
+    art_alpha = (art_arr[:, :, 3].astype(np.float32) / 255.0)
     text_alpha = mask_arr.astype(np.float32) / 255.0
     
     final_alpha = (art_alpha * text_alpha * 255.0).clip(0, 255).astype(np.uint8)
     art_arr[:, :, 3] = final_alpha
     return Image.fromarray(art_arr, "RGBA")
 
-def generate_50_tshirt_variations(phrase, style_profile, artwork_img=None, canvas_size=(3000, 3000), master_seed=42):
+def generate_50_tshirt_variations(phrase, artwork_img=None, canvas_size=(3000, 3000), master_seed=42):
     variations = []
     w, h = canvas_size
 
@@ -380,34 +265,18 @@ def generate_50_tshirt_variations(phrase, style_profile, artwork_img=None, canva
         seed = master_seed + (idx * 999)
         random.seed(seed)
         
-        text_mask = render_styled_text_layout(phrase, style_profile, canvas_size, seed)
+        text_mask = render_styled_text_layout(phrase, canvas_size, seed)
         
         if artwork_img is not None:
-            composited = apply_artwork_clipping_mask(artwork_img, text_mask, tile=(idx % 3 == 0))
+            composited = apply_artwork_clipping_mask(artwork_img, text_mask)
         else:
             solid_black = Image.new("RGBA", canvas_size, (0, 0, 0, 255))
             composited = apply_artwork_clipping_mask(solid_black, text_mask)
 
-        mask_arr = np.array(text_mask, dtype=np.uint8)
-        stroke_w = random.choice([0, 8, 14, 20])
-        
-        if stroke_w > 0:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (stroke_w * 2 + 1, stroke_w * 2 + 1))
-            border = cv2.subtract(cv2.dilate(mask_arr, kernel, iterations=1), mask_arr)
-            border_rgba = np.zeros((h, w, 4), dtype=np.uint8)
-            border_rgba[:, :, 3] = border
-            
-            final_img = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
-            final_img.alpha_composite(Image.fromarray(border_rgba, "RGBA"))
-            final_img.alpha_composite(composited)
-        else:
-            final_img = composited
-
         variations.append({
             "id": idx + 1,
-            "seed": seed,
             "style_name": f"{LAYOUT_STYLES[idx % len(LAYOUT_STYLES)]} (Var #{idx+1})",
-            "image": final_img
+            "image": composited
         })
     return variations
 
@@ -445,22 +314,17 @@ def package_zip_export(variations):
 
 if "components" not in st.session_state:
     st.session_state.components = []
-if "style_profile" not in st.session_state:
-    st.session_state.style_profile = {
-        "stroke_thickness": 0.50, "roughness": 0.30, "aspect_ratio": 0.80,
-        "height_variation": 0.20, "baseline_wobble": 0.15, "angularity": 0.40
-    }
 if "generated_ttf" not in st.session_state:
     st.session_state.generated_ttf = None
 if "tshirt_variations" not in st.session_state:
     st.session_state.tshirt_variations = []
 
 st.sidebar.title("✍️ Navigation")
-app_mode = st.sidebar.radio("Select Mode:", ["Mode A: Make My Font", "Mode B: Style Generator & T-Shirt Studio"])
+app_mode = st.sidebar.radio("Select Mode:", ["Mode A: Make My Font", "Mode B: T-Shirt Design Studio"])
 
 if app_mode == "Mode A: Make My Font":
     st.title("🔤 Mode A — Make My Font (.TTF Compiler)")
-    st.write("Upload an alphabet reference sheet, map character glyphs, and compile a genuine installable TrueType (.ttf) font.")
+    st.write("Upload an alphabet sheet (like `A-Z`), adjust parameters, map character glyphs, and generate an installable TrueType (.ttf) font.")
 
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -470,30 +334,29 @@ if app_mode == "Mode A: Make My Font":
             pil_img = Image.open(ref_file).convert("RGBA")
             contrast_val = st.slider("Contrast Enhancement:", 0.5, 3.0, 1.2)
             denoise_val = st.slider("Denoise Strength:", 0, 20, 5)
+            dilation_val = st.slider("Stroke Connect Dilation:", 1, 15, 7, help="Connects separate pen strokes within letters")
             
             binary_mask, cleaned_preview = preprocess_reference_image(pil_img, contrast=contrast_val, denoise_strength=denoise_val)
             st.image(cleaned_preview, caption="Cleaned Threshold Mask", use_container_width=True)
             
             if st.button("🔍 Detect & Extract Glyphs"):
-                st.session_state.components = detect_and_extract_glyphs(binary_mask)
+                st.session_state.components = detect_and_extract_glyphs(binary_mask, dilation_size=dilation_val)
                 st.success(f"Detected {len(st.session_state.components)} glyph components!")
 
     with col2:
         st.subheader("2. Interactive Character Mapping")
         if st.session_state.components:
-            st.write(f"Showing all **{len(st.session_state.components)}** detected components:")
+            st.write(f"Detected **{len(st.session_state.components)}** character glyphs:")
             
-            # Displays ALL detected glyphs dynamically
+            # Interactive grid displaying ALL detected glyphs
             for idx, comp in enumerate(st.session_state.components):
-                c1, c2, c3 = st.columns([1, 2, 2])
+                c1, c2 = st.columns([1, 3])
                 with c1:
-                    st.image(comp["preview_img"], width=60)
+                    st.image(comp["preview_img"], width=65)
                 with c2:
-                    comp["assigned_char"] = st.text_input(f"Char #{idx+1}", value=comp["assigned_char"], key=f"char_{idx}", max_chars=1)
-                with c3:
-                    comp["classification"] = st.selectbox(f"Type #{idx+1}", ["Letter", "Decoration", "Ignore"], key=f"type_{idx}")
+                    comp["assigned_char"] = st.text_input(f"Character #{idx+1}", value=comp["assigned_char"], key=f"char_{idx}", max_chars=1)
 
-            font_name_input = st.text_input("Font Family Name:", "MyHandwritingFont")
+            font_name_input = st.text_input("Font Family Name:", "MyHandwriting")
             if st.button("⚙️ Build & Compile .TTF Binary"):
                 try:
                     ttf_bytes = compile_ttf_font(st.session_state.components, font_name=font_name_input)
@@ -506,36 +369,18 @@ if app_mode == "Mode A: Make My Font":
                 st.download_button("📥 Download .TTF Font", st.session_state.generated_ttf, f"{font_name_input}.ttf", "font/ttf")
 
 else:
-    st.title("👕 Mode B — Style Generator & T-Shirt Studio")
-    st.write("Extract style vectors from reference sketches, adjust procedural controls, and generate 50 T-shirt print designs with artwork clipping masks.")
+    st.title("👕 Mode B — T-Shirt Design Studio")
+    st.write("Generate 50 T-shirt print compositions with uploaded artwork patterns clipped inside your phrase.")
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🎛️ Style Controls")
-    st.session_state.style_profile["stroke_thickness"] = st.sidebar.slider("Stroke Thickness:", 0.1, 1.0, float(st.session_state.style_profile["stroke_thickness"]))
-    st.session_state.style_profile["roughness"] = st.sidebar.slider("Roughness:", 0.0, 1.0, float(st.session_state.style_profile["roughness"]))
-    st.session_state.style_profile["baseline_wobble"] = st.sidebar.slider("Baseline Wobble:", 0.0, 1.0, float(st.session_state.style_profile["baseline_wobble"]))
     master_seed = st.sidebar.number_input("Random Seed:", value=42, step=1)
 
-    tab_ref, tab_tshirt, tab_export = st.tabs(["1. Reference Sample", "2. T-Shirt Studio", "3. Export Gallery"])
-
-    with tab_ref:
-        ref_b_file = st.file_uploader("Upload Style Sketch (e.g. 'Most'):", type=["png", "jpg", "jpeg", "webp"], key="mode_b_file")
-        if ref_b_file:
-            pil_b = Image.open(ref_b_file).convert("RGBA")
-            st.image(pil_b, caption="Reference Sketch", width=350)
-            binary_mask_b, _ = preprocess_reference_image(pil_b)
-            comps_b = detect_and_extract_glyphs(binary_mask_b)
-            
-            if st.button("📊 Extract Style Vector Profile"):
-                st.session_state.style_profile.update(extract_style_profile(comps_b))
-                st.success("Style Profile extracted!")
-                st.json(st.session_state.style_profile)
+    tab_tshirt, tab_export = st.tabs(["1. Design Studio", "2. Export Gallery"])
 
     with tab_tshirt:
         col_t1, col_t2 = st.columns([1, 1])
         with col_t1:
             tshirt_phrase = st.text_area("Enter Phrase:", value="MAKE YOUR OWN PATH").upper()
-            art_file = st.file_uploader("Upload Pattern/Flower Artwork:", type=["png", "jpg", "jpeg", "webp"], key="art_upload")
+            art_file = st.file_uploader("Upload Pattern/Flower Artwork Fill:", type=["png", "jpg", "jpeg", "webp"], key="art_upload")
             artwork_pil = Image.open(art_file).convert("RGBA") if art_file else None
 
         with col_t2:
@@ -545,7 +390,7 @@ else:
             if st.button("🚀 GENERATE 50 T-SHIRT DESIGNS", type="primary", use_container_width=True):
                 with st.spinner("Generating 50 compositions..."):
                     st.session_state.tshirt_variations = generate_50_tshirt_variations(
-                        tshirt_phrase, st.session_state.style_profile, artwork_pil, canvas_dim, master_seed
+                        tshirt_phrase, artwork_pil, canvas_dim, master_seed
                     )
                 st.success("Generated 50 unique T-shirt designs!")
 
