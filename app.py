@@ -41,8 +41,8 @@ CHARACTER_SET = (
     "0123456789"
 )
 
-MIN_COMPONENT_AREA = 80
-DEFAULT_PROXIMITY = 10
+MIN_COMPONENT_AREA = 100
+DEFAULT_PROXIMITY = 8
 
 
 # ============================================================
@@ -90,7 +90,7 @@ if "font_characters" not in st.session_state:
 
 
 # ============================================================
-# IMAGE PREPROCESSING & GLYPH EXTRACTION
+# IMAGE PREPROCESSING & CONSTRAINED GLYPH EXTRACTION
 # ============================================================
 
 def preprocess_reference_image(pil_image, contrast=1.1, denoise_strength=5):
@@ -128,13 +128,16 @@ def preprocess_reference_image(pil_image, contrast=1.1, denoise_strength=5):
     return cleaned, Image.fromarray(preview)
 
 
-def merge_nearby_stroke_boxes(boxes, max_distance=10):
+def merge_nearby_stroke_boxes(boxes, max_gap_x=8, max_gap_y=8):
     """
-    Merges components belonging to the same handwritten character (e.g. dots, crossbars)
-    without bridging across distinct letters.
+    Merges disconnected strokes belonging to the SAME character (e.g. dots, crossbars)
+    without runaway horizontal or vertical chaining across different letters.
     """
     if not boxes:
         return []
+
+    # Sort boxes by size descending so main glyph bodies act as anchors first
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
 
     merged = []
     used = [False] * len(boxes)
@@ -148,32 +151,41 @@ def merge_nearby_stroke_boxes(boxes, max_distance=10):
         masks_to_combine = [(x1, y1, mask1)]
         used[i] = True
 
-        changed = True
-        while changed:
-            changed = False
-            for j in range(len(boxes)):
-                if used[j]:
-                    continue
-                xj, yj, wj, hj, maskj = boxes[j]
+        # STRICT LIMIT: A single character glyph should never exceed 2.2x anchor width
+        # or 1.8x anchor height.
+        max_allowed_w = int(w1 * 2.2) + 30
+        max_allowed_h = int(h1 * 1.8) + 30
 
-                overlap_y = max(0, min(curr_y2, yj + hj) - max(curr_y1, yj))
-                horizontal_gap = max(0, max(curr_x1 - (xj + wj), xj - curr_x2))
-                vertical_gap = max(0, max(curr_y1 - (yj + hj), yj - curr_y2))
+        for j in range(len(boxes)):
+            if used[j]:
+                continue
+            xj, yj, wj, hj, maskj = boxes[j]
 
-                # Allow merging only for vertically aligned accents or tight stroke intersections
-                should_merge = (
-                    (horizontal_gap <= max_distance and overlap_y > 0) or
-                    (vertical_gap <= max_distance and (min(curr_x2, xj + wj) - max(curr_x1, xj)) > 0)
-                )
+            gap_x = max(0, max(curr_x1 - (xj + wj), xj - curr_x2))
+            gap_y = max(0, max(curr_y1 - (yj + hj), yj - curr_y2))
 
-                if should_merge:
-                    curr_x1 = min(curr_x1, xj)
-                    curr_y1 = min(curr_y1, yj)
-                    curr_x2 = max(curr_x2, xj + wj)
-                    curr_y2 = max(curr_y2, yj + hj)
-                    masks_to_combine.append((xj, yj, maskj))
-                    used[j] = True
-                    changed = True
+            overlap_x = max(0, min(curr_x2, xj + wj) - max(curr_x1, xj))
+            overlap_y = max(0, min(curr_y2, yj + hj) - max(curr_y1, yj))
+
+            new_x1 = min(curr_x1, xj)
+            new_y1 = min(curr_y1, yj)
+            new_w = max(curr_x2, xj + wj) - new_x1
+            new_h = max(curr_y2, yj + hj) - new_y1
+
+            # Block merges that would exceed maximum glyph proportion caps
+            if new_w > max_allowed_w or new_h > max_allowed_h:
+                continue
+
+            # Strict alignment checks for accents/dots vs horizontal strokes
+            is_accent_or_dot = (gap_y <= max_gap_y and overlap_x > 0.3 * min(w1, wj))
+            is_touching_stroke = (gap_x <= max_gap_x and overlap_y > 0.4 * min(h1, hj))
+
+            if is_accent_or_dot or is_touching_stroke:
+                curr_x1, curr_y1 = new_x1, new_y1
+                curr_x2 = max(curr_x2, xj + wj)
+                curr_y2 = max(curr_y2, yj + hj)
+                masks_to_combine.append((xj, yj, maskj))
+                used[j] = True
 
         mw = curr_x2 - curr_x1
         mh = curr_y2 - curr_y1
@@ -192,21 +204,33 @@ def merge_nearby_stroke_boxes(boxes, max_distance=10):
 
 def detect_and_extract_glyphs(binary_mask, min_area=MIN_COMPONENT_AREA, proximity_threshold=DEFAULT_PROXIMITY):
     h_img, w_img = binary_mask.shape
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
+
+    # Morphological erosion pass breaks light touching lines between adjacent calligraphic flourishes
+    kernel_sep = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    eroded_mask = cv2.erode(binary_mask, kernel_sep, iterations=1)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eroded_mask, connectivity=8)
 
     raw_boxes = []
+    max_w_limit = int(w_img * 0.15)
+    max_h_limit = int(h_img * 0.28)
+
     for i in range(1, num_labels):
         x, y, w, h, area = stats[i]
 
-        if area < min_area or w < 5 or h < 5:
+        if area < min_area or w < 6 or h < 6:
             continue
-        if w > w_img * 0.25 or h > h_img * 0.40:
+        if w > max_w_limit or h > max_h_limit:
             continue
 
         crop = binary_mask[y:y + h, x:x + w]
         raw_boxes.append((int(x), int(y), int(w), int(h), crop))
 
-    merged_components = merge_nearby_stroke_boxes(raw_boxes, max_distance=proximity_threshold)
+    merged_components = merge_nearby_stroke_boxes(
+        raw_boxes,
+        max_gap_x=proximity_threshold,
+        max_gap_y=proximity_threshold
+    )
 
     extracted = []
     for idx, (x, y, w, h, crop_mask) in enumerate(merged_components):
@@ -223,8 +247,8 @@ def detect_and_extract_glyphs(binary_mask, min_area=MIN_COMPONENT_AREA, proximit
 
     if extracted:
         heights = [item["bbox"][3] for item in extracted]
-        avg_h = max(20, np.mean(heights))
-        row_height = max(25, int(avg_h * 0.85))
+        avg_h = max(25, np.mean(heights))
+        row_height = max(30, int(avg_h * 0.75))
 
         extracted.sort(key=lambda item: (
             item["bbox"][1] // row_height,
@@ -602,7 +626,7 @@ if app_mode == "1. Extract & Build 50-Variant TTF":
         with col2:
             denoise_val = st.slider("Denoise", 0, 15, 5, 1)
         with col3:
-            proximity_val = st.slider("Stroke Clustering", 3, 30, DEFAULT_PROXIMITY, 1)
+            proximity_val = st.slider("Stroke Clustering", 2, 25, DEFAULT_PROXIMITY, 1)
 
         binary_mask, cleaned_preview = preprocess_reference_image(pil_img, contrast=contrast_val, denoise_strength=denoise_val)
         st.image(cleaned_preview, caption="Cleaned Reference", use_container_width=True)
