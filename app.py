@@ -45,6 +45,14 @@ def preprocess_reference_image(pil_image, contrast=1.2, brightness=0, denoise_st
         cv2.THRESH_BINARY_INV, 41, 12
     )
     
+    # Crop 3% outer border to strip photo edge artifacts/shadows
+    h, w = binary.shape
+    border_y, border_x = int(h * 0.03), int(w * 0.03)
+    binary[:border_y, :] = 0
+    binary[-border_y:, :] = 0
+    binary[:, :border_x] = 0
+    binary[:, -border_x:] = 0
+
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
     
@@ -61,7 +69,9 @@ def detect_and_extract_glyphs(binary_mask, min_area=300, dilation_size=7):
 
     for i in range(1, n):
         x, y, w, h, area = stats[i]
-        if area < min_area or w < 15 or h < 15:
+        
+        # Filter noise & giant edge borders
+        if area < min_area or w < 15 or h < 15 or w > binary_mask.shape[1] * 0.5 or h > binary_mask.shape[0] * 0.5:
             continue
         
         # Crop mask from non-dilated binary mask
@@ -183,7 +193,10 @@ def compile_ttf_font(mapped_components, font_name="MyHandwriting", units_per_em=
     fb = FontBuilder(units_per_em, isTTF=True)
     fb.setupGlyphOrder(glyph_order)
     fb.setupCharacterMap(cmap)
-    fb.setupGlyphs(glyph_objects)
+    
+    # FIXED: setupGlyf() is the correct method for TTF fonts in fontTools
+    fb.setupGlyf(glyph_objects)
+    
     fb.setupHorizontalMetrics(metrics)
     fb.setupHorizontalHeader(ascent=800, descent=-200)
     fb.setupNameTable({
