@@ -19,31 +19,90 @@ st.set_page_config(
 )
 
 # ============================================================
-# UTILITIES & IMAGE PROCESSING
+# UTILITIES & ROBUST IMAGE PROCESSING
 # ============================================================
 
 def preprocess_reference_image(pil_image, contrast=1.2, brightness=0, denoise_strength=5):
     arr = np.array(pil_image.convert("RGB"))
+    
+    # 1. Perspective Flattening & Shadow Removal
     if contrast != 1.0 or brightness != 0:
         arr = cv2.convertScaleAbs(arr, alpha=contrast, beta=brightness)
         
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    if denoise_strength > 0:
-        gray = cv2.fastNlMeansDenoising(gray, h=denoise_strength)
-        
-    bg_size = max(31, int(min(gray.shape) * 0.05) | 1)
-    binary = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, bg_size, 10
-    )
     
+    # Estimate uneven paper background lighting
+    bg_dilated = cv2.dilate(gray, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    bg_smooth = cv2.medianBlur(bg_dilated, 21)
+    diff = 255 - cv2.absdiff(gray, bg_smooth)
+    norm = cv2.normalize(diff, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
+    
+    if denoise_strength > 0:
+        norm = cv2.fastNlMeansDenoising(norm, h=denoise_strength)
+        
+    # Adaptive Otsu Thresholding
+    _, binary = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Fill tiny gaps without destroying thin strokes
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     
     preview_cleaned = cv2.cvtColor(255 - cleaned, cv2.COLOR_GRAY2RGBA)
     return cleaned, Image.fromarray(preview_cleaned)
 
-def detect_and_extract_glyphs(binary_mask, min_area=100, max_area_pct=0.85):
+def merge_nearby_boxes(boxes, distance_threshold=25):
+    """Merges disconnected pen strokes and dots into unified letter components."""
+    if not boxes:
+        return []
+        
+    merged = []
+    used = [False] * len(boxes)
+    
+    for i in range(len(boxes)):
+        if used[i]:
+            continue
+        x1, y1, w1, h1, a1, mask1 = boxes[i]
+        curr_x2, curr_y2 = x1 + w1, y1 + h1
+        curr_x1, curr_y1 = x1, y1
+        masks_to_combine = [(x1, y1, mask1)]
+        used[i] = True
+        
+        changed = True
+        while changed:
+            changed = False
+            for j in range(len(boxes)):
+                if used[j]:
+                    continue
+                xj, yj, wj, hj, aj, maskj = boxes[j]
+                
+                # Check bounding box distance
+                if not (xj > curr_x2 + distance_threshold or 
+                        xj + wj < curr_x1 - distance_threshold or 
+                        yj > curr_y2 + distance_threshold or 
+                        yj + hj < curr_y1 - distance_threshold):
+                    
+                    curr_x1 = min(curr_x1, xj)
+                    curr_y1 = min(curr_y1, yj)
+                    curr_x2 = max(curr_x2, xj + wj)
+                    curr_y2 = max(curr_y2, yj + hj)
+                    masks_to_combine.append((xj, yj, maskj))
+                    used[j] = True
+                    changed = True
+                    
+        # Reconstruct combined mask
+        mw, mh = curr_x2 - curr_x1, curr_y2 - curr_y1
+        combined_mask = np.zeros((mh, mw), dtype=np.uint8)
+        for mx, my, mmask in masks_to_combine:
+            ox, oy = mx - curr_x1, my - curr_y1
+            combined_mask[oy:oy+mmask.shape[0], ox:ox+mmask.shape[1]] = cv2.bitwise_or(
+                combined_mask[oy:oy+mmask.shape[0], ox:ox+mmask.shape[1]], mmask
+            )
+            
+        merged.append((curr_x1, curr_y1, mw, mh, combined_mask))
+        
+    return merged
+
+def detect_and_extract_glyphs(binary_mask, min_area=80, max_area_pct=0.85):
     h_img, w_img = binary_mask.shape
     max_area = h_img * w_img * max_area_pct
     
@@ -51,28 +110,36 @@ def detect_and_extract_glyphs(binary_mask, min_area=100, max_area_pct=0.85):
         binary_mask, connectivity=8
     )
     
-    extracted_components = []
+    raw_boxes = []
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         x, y, w, h = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
         
-        if min_area <= area <= max_area and w > 5 and h > 5:
-            component_crop = binary_mask[y:y+h, x:x+w]
-            rgba_crop = np.zeros((h, w, 4), dtype=np.uint8)
-            rgba_crop[component_crop > 0] = [0, 0, 0, 255]
+        if min_area <= area <= max_area and w > 4 and h > 4:
+            crop = binary_mask[y:y+h, x:x+w]
+            raw_boxes.append((x, y, w, h, area, crop))
             
-            extracted_components.append({
-                "id": i,
-                "bbox": (x, y, w, h),
-                "area": area,
-                "aspect_ratio": float(w) / float(h),
-                "crop_mask": component_crop,
-                "preview_img": Image.fromarray(rgba_crop, "RGBA"),
-                "classification": "Letter" if (w * h > 300) else "Decoration",
-                "assigned_char": ""
-            })
-            
-    extracted_components.sort(key=lambda c: (c["bbox"][1] // 50, c["bbox"][0]))
+    # Merge disconnected pen strokes/dots
+    merged_components = merge_nearby_boxes(raw_boxes, distance_threshold=20)
+    
+    extracted_components = []
+    for idx, (x, y, w, h, crop_mask) in enumerate(merged_components):
+        rgba_crop = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba_crop[crop_mask > 0] = [0, 0, 0, 255]
+        
+        extracted_components.append({
+            "id": idx + 1,
+            "bbox": (x, y, w, h),
+            "area": w * h,
+            "aspect_ratio": float(w) / float(h),
+            "crop_mask": crop_mask,
+            "preview_img": Image.fromarray(rgba_crop, "RGBA"),
+            "classification": "Letter" if (w * h > 250) else "Decoration",
+            "assigned_char": ""
+        })
+        
+    # Sort left-to-right, top-to-bottom
+    extracted_components.sort(key=lambda c: (c["bbox"][1] // 120, c["bbox"][0]))
     return extracted_components
 
 def extract_style_profile(components):
@@ -148,7 +215,6 @@ def compile_ttf_font(mapped_components, font_name="HandmadeFont", units_per_em=2
     cmap = {32: "space"}
     char_glyph_map = {}
     
-    # Auto-assign characters if user didn't enter any
     default_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
     auto_idx = 0
 
@@ -415,7 +481,10 @@ if app_mode == "Mode A: Make My Font":
     with col2:
         st.subheader("2. Interactive Character Mapping")
         if st.session_state.components:
-            for idx, comp in enumerate(st.session_state.components[:20]):
+            st.write(f"Showing all **{len(st.session_state.components)}** detected components:")
+            
+            # Displays ALL detected glyphs dynamically
+            for idx, comp in enumerate(st.session_state.components):
                 c1, c2, c3 = st.columns([1, 2, 2])
                 with c1:
                     st.image(comp["preview_img"], width=60)
