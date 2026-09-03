@@ -41,8 +41,8 @@ CHARACTER_SET = (
     "0123456789"
 )
 
-MIN_COMPONENT_AREA = 150
-DEFAULT_PROXIMITY = 18
+MIN_COMPONENT_AREA = 80
+DEFAULT_PROXIMITY = 10
 
 
 # ============================================================
@@ -90,7 +90,7 @@ if "font_characters" not in st.session_state:
 
 
 # ============================================================
-# RESTORED EXTRACTION & DETECTION ENGINE
+# IMAGE PREPROCESSING & GLYPH EXTRACTION
 # ============================================================
 
 def preprocess_reference_image(pil_image, contrast=1.1, denoise_strength=5):
@@ -101,7 +101,6 @@ def preprocess_reference_image(pil_image, contrast=1.1, denoise_strength=5):
 
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
-    # Background illumination estimation & shadow removal
     bg_dilated = cv2.dilate(gray, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
     bg_smooth = cv2.medianBlur(bg_dilated, 21)
     diff = 255 - cv2.absdiff(gray, bg_smooth)
@@ -110,13 +109,11 @@ def preprocess_reference_image(pil_image, contrast=1.1, denoise_strength=5):
     if denoise_strength > 0:
         norm = cv2.fastNlMeansDenoising(norm, h=denoise_strength)
 
-    # Adaptive thresholding
     binary = cv2.adaptiveThreshold(
         norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV, 41, 12
     )
 
-    # Safe crop outer margin to avoid image border shadows
     h, w = binary.shape
     border_y, border_x = int(h * 0.03), int(w * 0.03)
     binary[:border_y, :] = 0
@@ -131,7 +128,11 @@ def preprocess_reference_image(pil_image, contrast=1.1, denoise_strength=5):
     return cleaned, Image.fromarray(preview)
 
 
-def merge_nearby_stroke_boxes(boxes, max_distance=18):
+def merge_nearby_stroke_boxes(boxes, max_distance=10):
+    """
+    Merges components belonging to the same handwritten character (e.g. dots, crossbars)
+    without bridging across distinct letters.
+    """
     if not boxes:
         return []
 
@@ -155,14 +156,17 @@ def merge_nearby_stroke_boxes(boxes, max_distance=18):
                     continue
                 xj, yj, wj, hj, maskj = boxes[j]
 
-                separated = (
-                    xj > curr_x2 + max_distance or
-                    xj + wj < curr_x1 - max_distance or
-                    yj > curr_y2 + max_distance or
-                    yj + hj < curr_y1 - max_distance
+                overlap_y = max(0, min(curr_y2, yj + hj) - max(curr_y1, yj))
+                horizontal_gap = max(0, max(curr_x1 - (xj + wj), xj - curr_x2))
+                vertical_gap = max(0, max(curr_y1 - (yj + hj), yj - curr_y2))
+
+                # Allow merging only for vertically aligned accents or tight stroke intersections
+                should_merge = (
+                    (horizontal_gap <= max_distance and overlap_y > 0) or
+                    (vertical_gap <= max_distance and (min(curr_x2, xj + wj) - max(curr_x1, xj)) > 0)
                 )
 
-                if not separated:
+                if should_merge:
                     curr_x1 = min(curr_x1, xj)
                     curr_y1 = min(curr_y1, yj)
                     curr_x2 = max(curr_x2, xj + wj)
@@ -194,8 +198,9 @@ def detect_and_extract_glyphs(binary_mask, min_area=MIN_COMPONENT_AREA, proximit
     for i in range(1, num_labels):
         x, y, w, h, area = stats[i]
 
-        # Broad bounds to ensure no small dots or valid letters are dropped
-        if area < min_area or w < 6 or h < 6 or w > w_img * 0.45 or h > h_img * 0.45:
+        if area < min_area or w < 5 or h < 5:
+            continue
+        if w > w_img * 0.25 or h > h_img * 0.40:
             continue
 
         crop = binary_mask[y:y + h, x:x + w]
@@ -216,11 +221,10 @@ def detect_and_extract_glyphs(binary_mask, min_area=MIN_COMPONENT_AREA, proximit
             "assigned_char": ""
         })
 
-    # Restored Dynamic Row-Sorting Logic
     if extracted:
         heights = [item["bbox"][3] for item in extracted]
         avg_h = max(20, np.mean(heights))
-        row_height = max(30, int(avg_h * 0.8))
+        row_height = max(25, int(avg_h * 0.85))
 
         extracted.sort(key=lambda item: (
             item["bbox"][1] // row_height,
@@ -598,7 +602,7 @@ if app_mode == "1. Extract & Build 50-Variant TTF":
         with col2:
             denoise_val = st.slider("Denoise", 0, 15, 5, 1)
         with col3:
-            proximity_val = st.slider("Stroke Clustering", 3, 40, DEFAULT_PROXIMITY, 1)
+            proximity_val = st.slider("Stroke Clustering", 3, 30, DEFAULT_PROXIMITY, 1)
 
         binary_mask, cleaned_preview = preprocess_reference_image(pil_img, contrast=contrast_val, denoise_strength=denoise_val)
         st.image(cleaned_preview, caption="Cleaned Reference", use_container_width=True)
@@ -616,7 +620,7 @@ if app_mode == "1. Extract & Build 50-Variant TTF":
     if st.session_state.components:
         st.divider()
         st.header("📝 Character Mapping")
-        
+
         for idx, component in enumerate(st.session_state.components):
             c1, c2, c3 = st.columns([1, 2, 5])
             with c1:
