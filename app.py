@@ -240,9 +240,6 @@ def detect_and_extract_glyphs(binary_mask, min_area=MIN_COMPONENT_AREA, proximit
 # ============================================================
 
 def generate_fallback_bitmap(character, target_h=400, target_w=300):
-    """
-    Renders a clean hand-drawn style bitmap mask for unmapped/missing characters.
-    """
     img = Image.new("L", (target_w, target_h), 0)
     draw = ImageDraw.Draw(img)
 
@@ -423,6 +420,7 @@ def compile_50_variant_ttf(mapped_components, font_name="MyHandwriting50Var"):
     metrics = {".notdef": (600, 0), "space": (300, 0)}
     available_characters = set()
 
+    # .NOTDEF GLYPH
     notdef_pen = TTGlyphPen(None)
     notdef_pen.moveTo((100, 0))
     notdef_pen.lineTo((100, 700))
@@ -430,6 +428,10 @@ def compile_50_variant_ttf(mapped_components, font_name="MyHandwriting50Var"):
     notdef_pen.lineTo((500, 0))
     notdef_pen.closePath()
     glyph_objects[".notdef"] = notdef_pen.glyph()
+
+    # SPACE GLYPH (Explicitly defined empty pen outline)
+    space_pen = TTGlyphPen(None)
+    glyph_objects["space"] = space_pen.glyph()
 
     # Collect explicitly mapped characters
     character_map = {}
@@ -441,7 +443,6 @@ def compile_50_variant_ttf(mapped_components, font_name="MyHandwriting50Var"):
     # Fallback Generation for missing letters/numbers
     for char in CHARACTER_SET:
         if char not in character_map:
-            # Generate fallback bitmap mask
             character_map[char] = generate_fallback_bitmap(char)
 
     # Compile all characters into TTF
@@ -477,7 +478,6 @@ def compile_50_variant_ttf(mapped_components, font_name="MyHandwriting50Var"):
             pua_codepoint = get_pua_codepoint(character, variation_idx)
             cmap[pua_codepoint] = variant_gname
 
-    # Fixed FontBuilder parameter: unitsPerEm (camelCase)
     fb = FontBuilder(unitsPerEm=UNITS_PER_EM, isTTF=True)
     fb.setupGlyphOrder(glyph_order)
     fb.setupCharacterMap(cmap)
